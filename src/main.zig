@@ -1,4 +1,5 @@
 const std = @import("std");
+const mem = std.mem;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Allocator = std.mem.Allocator;
 
@@ -8,14 +9,23 @@ pub const Atom = union(enum) {
 
     pub const Number = i64;
     pub const Symbol = []const u8;
+
+    pub fn print(self: Atom) !void {
+        switch (self) {
+            .number => std.debug.print("{d}\n", .{ self.number }),
+            .symbol => std.debug.print("{s}\n", .{ self.symbol })
+        }
+    }
 };
 
-pub const Expr = struct {
-    head: union(enum) {
-        expr: *Expr,
-        atom: Atom,
-    },
-    tail: *Expr,
+pub const Cons = union(enum) {
+    list: List,
+    atom: Atom,
+};
+
+pub const List = ?struct {
+    head: *Cons,
+    tail: *List,
 };
 
 const Env = struct {
@@ -28,31 +38,12 @@ const Parser = struct {
     index: usize,
 
     const log = std.log.scoped(.parser);
-    const separator: []const u8 = &std.ascii.whitespace ++ [_]u8{ '(', ')' };
+    const whitespace: []const u8 = &std.ascii.whitespace;
+    const separator: []const u8 = whitespace ++ "()";
 
-    const Error = error{
-        ParseFail,
-        EndOfBuffer,
-    } || Allocator.Error;
-
-    pub fn match(self: *Parser, comptime pattern: anytype) !void {
-        if (@TypeOf(pattern) == []const u8) {
-            if (self.buffer.len < self.index) {
-                return Error.EndOfBuffer;
-            }
-
-            const token = self.buffer[self.index..];
-            if (std.mem.eql(u8, token[0..pattern.len], pattern)) {
-                self.index += pattern.len;
-                return;
-            }
-
-            return Error.ParseFail;
-        }
-    }
+    const Error = error{ ParseFail } || Allocator.Error;
 
     pub fn recover(self: *Parser, comptime T: type) !?T {
-
         const start = self.index;
         return self.parse(T) catch |err| switch (err) {
             error.ParseFail => {
@@ -64,9 +55,9 @@ const Parser = struct {
     }
 
     pub fn parse(self: *Parser, comptime T: type) Error!T {
+        self.index = mem.indexOfNonePos(u8, self.buffer, self.index, whitespace) orelse self.buffer.len;
         switch (T) {
             Atom => {
-                self.index = std.mem.indexOfNonePos(u8, self.buffer, self.index, &std.ascii.whitespace) orelse self.buffer.len;
 
                 if (try self.recover(Atom.Number)) |number| {
                     return Atom{ .number = number };
@@ -77,22 +68,42 @@ const Parser = struct {
                 }
             },
             Atom.Number => {
+                // match until separator ("\r\n\t ()")
                 const start = self.index;
-                const end = std.mem.indexOfAnyPos(u8, self.buffer, start, separator) orelse self.buffer.len;
+                const end = mem.indexOfAnyPos(u8, self.buffer, start, separator) orelse self.buffer.len;
                 self.index = end;
 
                 return std.fmt.parseInt(i64, self.buffer[start..end], 0) catch error.ParseFail;
             },
             Atom.Symbol => {
+                // match until separator ("\r\n\t ()")
                 const start = self.index;
-                const end = std.mem.indexOfAnyPos(u8, self.buffer, start, separator) orelse self.buffer.len;
+                const end = mem.indexOfAnyPos(u8, self.buffer, start, separator) orelse self.buffer.len;
                 self.index = end;
 
-                if (start < end) {
-                    return self.arena.allocator().dupe(u8, self.buffer[start..end]);
+                const allocator = self.arena.allocator();
+
+                return if (start < end) allocator.dupe(u8, self.buffer[start..end]) else error.ParseFail;
+            },
+            List => {
+                const allocator = self.arena.allocator();
+
+                if (try self.recover(Cons)) |head| {
+                    const tail = try allocator.create(List);
+                    tail.* = try self.parse(List);
+
+                    return List{
+                        .head = head,
+                        .tail = tail,
+                    };
                 } else {
-                    return error.ParseFail;
+                    return null;
                 }
+
+                unreachable;
+            },
+            Cons => {
+                // atom or (list)
             },
             else => @compileError("Parser not defined for " ++ @typeName(T)),
         }
@@ -122,6 +133,6 @@ pub fn main() !void {
     var parser = Parser.init(s, gpa.allocator());
     defer parser.deinit();
 
-    std.debug.print("{} {d}\n", .{ try parser.parse(Atom), parser.index });
-    std.debug.print("{} {d}\n", .{ try parser.parse(Atom), parser.index });
+    try (try parser.parse(Atom)).print();
+    try (try parser.parse(Atom)).print();
 }
