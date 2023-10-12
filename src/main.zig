@@ -7,24 +7,36 @@ const Allocator = std.mem.Allocator;
 // tail : List -> ?List
 
 pub const Atom = union(enum) {
-    boolean: bool,
-    number: i64,
-    symbol: []const u8,
+    boolean: Boolean,
+    number: Number,
+    symbol: Symbol,
+    string: String,
+
+    pub const Boolean = bool;
+    pub const Number = i64;
+    // workaround, otherwise `switch (T)` would not differentiate Atom.Symbol from Atom.String.
+    pub const Symbol = std.meta.Tuple(&.{[]const u8});
+    pub const String = []const u8;
+
+    pub fn format(self: Atom, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        return switch (self) {
+            .boolean => std.fmt.format(writer, "{s}", .{if (self.boolean) "#t" else "#f"}),
+            .number => std.fmt.format(writer, "{d}", .{self.number}),
+            .string => std.fmt.format(writer, "\"{s}\"", .{self.string}),
+            .symbol => std.fmt.format(writer, "{s}", .{self.symbol[0]}),
+        };
+    }
 };
 
 pub const Cons = union(enum) {
     list: *?List,
     atom: Atom,
 
-    pub fn print(self: *const Cons, space: u8) void {
-        switch (self.*) {
-            .list => |list| if (list.*) |some| {
-                some.print(space);
-            } else {
-                std.debug.print("{s: >[1]}null\n", .{ "", space * 2 });
-            },
-            .atom => |atom| std.debug.print("{s: >[2]}{}\n", .{ "", atom, space * 2 }),
-        }
+    pub fn format(self: Cons, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        return switch (self) {
+            .atom => std.fmt.format(writer, "{}", .{self.atom}),
+            .list => std.fmt.format(writer, "({?})", .{self.list.*}),
+        };
     }
 };
 
@@ -32,12 +44,11 @@ pub const List = struct {
     head: Cons,
     tail: *?List,
 
-    pub fn print(self: *const List, space: u8) void {
-        self.head.print(space);
+    pub fn format(self: List, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        try std.fmt.format(writer, "{}", .{self.head});
+
         if (self.tail.*) |tail| {
-            tail.print(space + 1);
-        } else {
-            std.debug.print("{s: >[1]}null\n", .{ "", space * 2 });
+            try std.fmt.format(writer, " {}", .{tail});
         }
     }
 };
@@ -48,10 +59,10 @@ const Parser = struct {
     index: usize,
 
     const log = std.log.scoped(.parser);
-    const whitespace: []const u8 = &std.ascii.whitespace;
-    const separator: []const u8 = whitespace ++ "()";
 
-    const Error = error{ParseFail} || Allocator.Error;
+    const whitespace: []const u8 = &std.ascii.whitespace;
+    const separator: []const u8 = whitespace ++ "()[]";
+    pub const Error = error{ParseFail};
 
     pub fn recover(self: *Parser, comptime T: type) !?T {
         const start = self.index;
@@ -64,12 +75,13 @@ const Parser = struct {
         };
     }
 
-    pub fn match(self: *Parser, slice: []const u8) !void {
-        const start = try self.gotoNone(whitespace);
-        if (!mem.eql(u8, self.buffer[start .. start + slice.len], slice)) {
-            return error.ParseFail;
-        }
+    pub fn match(self: *Parser, slice: []const u8) bool {
+        const start = self.index;
+
+        if (!mem.eql(u8, self.buffer[start .. start + slice.len], slice)) return false;
         self.index += slice.len;
+
+        return true;
     }
 
     pub fn gotoAny(self: *Parser, values: []const u8) Error!usize {
@@ -88,35 +100,55 @@ const Parser = struct {
         return error.ParseFail;
     }
 
-    pub fn parse(self: *Parser, comptime T: type) Error!T {
+    // This might not be the right approach, but it looks cool.
+    pub fn parse(self: *Parser, comptime T: type) (Parser.Error || Allocator.Error)!T {
         switch (T) {
             Atom => {
-                if (try self.recover(i64)) |number| {
-                    return Atom{ .number = number };
-                }
+                if (try self.recover(Atom.Number)) |number| return Atom{ .number = number };
+                if (try self.recover(Atom.Boolean)) |boolean| return Atom{ .boolean = boolean };
+                if (try self.recover(Atom.String)) |string| return Atom{ .string = string };
+                if (try self.recover(Atom.Symbol)) |symbol| return Atom{ .symbol = symbol };
+                return error.ParseFail;
+            },
+            Atom.Boolean => {
+                if (!self.match("#")) return error.ParseFail;
 
-                if (try self.recover([]const u8)) |symbol| {
-                    return Atom{ .symbol = symbol };
-                }
+                if (self.match("t")) return true;
+                if (self.match("f")) return false;
 
                 return error.ParseFail;
             },
-            i64 => {
+            Atom.Number => {
                 const start = try self.gotoNone(whitespace);
                 const end = try self.gotoAny(separator);
 
                 return std.fmt.parseInt(i64, self.buffer[start..end], 0) catch error.ParseFail;
             },
-            []const u8 => {
+            Atom.String => {
+                const allocator = self.arena.allocator();
+
+                _ = try self.gotoNone(whitespace);
+                if (!self.match("\"")) return error.ParseFail;
+                const start = self.index;
+
+                if (self.match("\"")) {
+                    return &[_]u8{};
+                } else {
+                    const end = try self.gotoAny("\""); // does not check the current index, unexpected.
+                    if (!self.match("\"")) return error.ParseFail;
+
+                    return allocator.dupe(u8, self.buffer[start..end]);
+                }
+
+                return error.ParseFail;
+            },
+            Atom.Symbol => {
                 const allocator = self.arena.allocator();
 
                 const start = try self.gotoNone(whitespace);
                 const end = try self.gotoAny(separator);
 
-                if (start < end) {
-                    const sym = try allocator.dupe(u8, self.buffer[start..end]);
-                    return sym;
-                }
+                if (start < end) return .{try allocator.dupe(u8, self.buffer[start..end])};
 
                 return error.ParseFail;
             },
@@ -138,14 +170,22 @@ const Parser = struct {
             Cons => {
                 const allocator = self.arena.allocator();
 
-                if (try self.recover(Atom)) |atom| {
-                    return Cons{ .atom = atom };
-                }
+                if (try self.recover(Atom)) |atom| return Cons{ .atom = atom };
 
-                try self.match("(");
+                _ = try self.gotoNone(whitespace);
+
+                var expect: *const [1]u8 = undefined;
+                if (self.match("(")) {
+                    expect = ")";
+                } else if (self.match("[")) {
+                    expect = "]";
+                } else return error.ParseFail;
+
                 const list = try allocator.create(?List);
                 list.* = try self.recover(List);
-                try self.match(")");
+
+                _ = try self.gotoNone(whitespace);
+                if (!self.match(expect)) return error.ParseFail;
 
                 return Cons{ .list = list };
             },
@@ -158,10 +198,8 @@ const Parser = struct {
     }
 
     pub fn init(buffer: []const u8, allocator: Allocator) Parser {
-        const arena = ArenaAllocator.init(allocator);
-
-        return Parser{
-            .arena = arena,
+        return .{
+            .arena = ArenaAllocator.init(allocator),
             .buffer = buffer,
             .index = 0,
         };
@@ -169,15 +207,20 @@ const Parser = struct {
 };
 
 pub fn main() !void {
-    std.debug.print("{d}\n", .{@sizeOf(i64)});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
 
-    const s = "(255 (foo) (bar baz 123 412) λ α)";
+    var arena = ArenaAllocator.init(gpa.allocator());
+    defer arena.deinit();
 
-    var parser = Parser.init(s, gpa.allocator());
+    const stdin = std.io.getStdIn();
+    const input = try stdin.reader().readAllAlloc(arena.allocator(), 100 * 1028);
+
+    var parser = Parser.init(input, gpa.allocator());
     defer parser.deinit();
 
     const cons = try parser.parse(Cons);
-    cons.print(0);
+    std.debug.print("{}\n", .{cons});
+
+    std.debug.print("Arena Occupies: {d}\n", .{parser.arena.queryCapacity()});
 }
